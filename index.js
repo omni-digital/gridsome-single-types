@@ -1,83 +1,63 @@
-const path = require('path')
-const fs = require('fs-extra')
-const stackTrace = require('stack-trace')
-const { codeFrameColumns } = require('@babel/code-frame')
+const axios = require('axios')
+const query = require('./helpers/query')
+const { trimEnd, upperFirst, camelCase } = require('lodash')
 
-module.exports = ({ context, program }) => {
-  program
-    .command('develop')
-    .description('start development server')
-    .option('-p, --port <port>', 'use specified port (default: 8080)')
-    .option('-h, --host <host>', 'use specified host (default: 0.0.0.0)')
-    .action(args => {
-      wrapCommand(require('./lib/develop'))(context, args)
-    })
+module.exports = function (api, options) {
+  api.loadSource(async ({ addCollection }) => {
+    const { queryLimit, contentTypes, singleTypes, loginData } = options
+    const apiURL = trimEnd(options.apiURL, '/')
+    let jwtToken = null
 
-  program
-    .command('build')
-    .description('build site for production')
-    .action(() => {
-      wrapCommand(require('./lib/build'))(context, {})
-    })
+    console.log(`Fetching data from Strapi (${apiURL})`)
 
-  program
-    .command('explore')
-    .description('explore GraphQL data')
-    .option('-p, --port <port>', 'use specified port (default: 8080)')
-    .option('-h, --host <host>', 'use specified host (default: 0.0.0.0)')
-    .action(args => {
-      wrapCommand(require('./lib/explore'))(context, args)
-    })
+    // Check if loginData is set.
+    if (
+      loginData.hasOwnProperty('identifier') &&
+      loginData.identifier.length !== 0 &&
+      loginData.hasOwnProperty('password') &&
+      loginData.password.length !== 0
+    ) {
+      // Define API endpoint.
+      const loginEndpoint = `${apiURL}/auth/local`
 
-  program
-    .command('serve')
-    .description('start a production node.js server')
-    .option('-p, --port <port>', 'use specified port (default: 8080)')
-    .option('-h, --host <host>', 'use specified host (default: 0.0.0.0)')
-    .action(args => {
-      wrapCommand(require('./lib/serve'))(context, args)
-    })
-}
+      // Make API request.
+      try {
+        const loginResponse = await axios.post(loginEndpoint, loginData)
 
-function wrapCommand (fn) {
-  return (context, args) => {
-    return fn(context, args).catch(err => {
-      const callSite = getCallSite(context, err)
-      const fileName = callSite ? callSite.getFileName() : null
-      const filePath = typeof fileName === 'string'
-        ? path.resolve(context, fileName)
-        : null
-
-      if (filePath && fs.existsSync(filePath)) {
-        const line = callSite.getLineNumber()
-        const column = callSite.getColumnNumber() || 0
-        const fileContent = fs.readFileSync(filePath, 'utf8')
-        const location = { start: { line, column }}
-        const codeFrame = codeFrameColumns(fileContent, location, {
-          highlightCode: true
-        })
-
-        console.log(
-          `${err.name}: ${path.relative(context, filePath)}: ` +
-          `${err.message} (${line}:${column})` +
-          `\n\n${codeFrame}`
-        )
-      } else {
-        console.log(err.stack || err)
+        if (loginResponse.hasOwnProperty('data')) {
+          jwtToken = loginResponse.data.jwt
+        }
+      } catch (e) {
+        console.error('Strapi authentication error: ' + e)
       }
-
-      process.exitCode = 1
-    })
-  }
-}
-
-function getCallSite (context, err) {
-  return stackTrace.parse(err).find(callSite => {
-    const fileName = callSite.getFileName() || ''
-
-    return (
-      fileName.startsWith(context) &&
-      !/node_modules/.test(fileName)
+    }
+    return Promise.all([
+      Promise.all(contentTypes.map(resourceName => {
+        const typeName = upperFirst(camelCase(`${options.typeName} ${resourceName}`))
+        const collection = addCollection({ typeName, dateField: 'created_at' })
+        const isSingleType = false
+        return query({ apiURL, resourceName, jwtToken, queryLimit, isSingleType })
+          .then(docs => docs.forEach(doc => {
+            collection.addNode(doc)
+          })
+          )
+      })),
+      Promise.all(singleTypes.map(resourceName => {
+        const typeName = upperFirst(camelCase(`${options.typeName} ${resourceName}`))
+        const collection = addCollection({ typeName, dateField: 'created_at' })
+        const isSingleType = true
+        return query({ apiURL, resourceName, jwtToken, queryLimit, isSingleType })
+          .then(data => collection.addNode(data))
+      }))]
     )
   })
 }
+
+module.exports.defaultOptions = () => ({
+  apiURL: 'http://localhost:1337',
+  contentTypes: [],
+  singleTypes: [],
+  loginData: {},
+  queryLimit: 100,
+  typeName: 'Strapi'
+})
